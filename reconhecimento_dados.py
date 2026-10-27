@@ -5,80 +5,132 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-# Importa a função geradora de ticket do seu outro arquivo
-# (Se o arquivo for main.py, use: from main import emitir_ticket)
 from gerador_ticket import emitir_ticket
-from datetime import datetime
-from banco_estacionamento import cadastrar_entrada
+
 
 ARQUIVO = Path(__file__).parent / "dados.json"
 
 
 class MonitorJson(FileSystemEventHandler):
+
     def __init__(self):
         super().__init__()
-        # Guarda histórico do que já foi emitido para evitar tickets duplicados
-        self.itens_processados = set()
-        self.ultimo_registro_processado = None
 
-    def extrair_placa(self, item) -> str:
-        """Extrai o valor da placa suportando string direta ou dicionário."""
+        # Guarda os registros já processados durante esta execução.
+        self.itens_processados = set()
+
+        # Evita que eventos simultâneos processem o arquivo juntos.
+        self.lock_processamento = __import__("threading").Lock()
+
+        # Na inicialização, registra os dados existentes sem gerar tickets.
+        self.inicializar_historico()
+
+    def extrair_placa(self, item):
         if isinstance(item, dict):
-            return item.get("placa") or item.get("Placa") or "NÃO INFORMADA"
+            return item.get("placa") or item.get("Placa")
+
         if isinstance(item, str):
             return item
-        return "NÃO INFORMADA"
 
-    def processar_arquivo(self, caminho):
-        arquivo_alterado = Path(caminho)
+        return None
 
-        if arquivo_alterado.resolve() != ARQUIVO.resolve():
-            return
+    def obter_id(self, item):
+        """
+        Usa o horário e a placa como identificador.
+        Assim, veículos diferentes podem ter a mesma placa
+        em entradas diferentes.
+        """
+        if not isinstance(item, dict):
+            return str(item)
 
-        # Pausa para o arquivo terminar de ser gravado no disco
-        time.sleep(0.2)
+        return (
+            item.get("id"),
+            item.get("placa") or item.get("Placa"),
+            item.get("horario") or item.get("data_hora"),
+            item.get("nome"),
+        )
 
+    def ler_dados(self):
         try:
             with ARQUIVO.open("r", encoding="utf-8") as arquivo:
-                dados = json.load(arquivo)
-
-            # Caso 1: O JSON é uma lista acumulada de veículos
-            if isinstance(dados, list):
-                for index, item in enumerate(dados):
-                    # Cria um identificador único para cada entrada da lista
-                    item_id = item.get("id") if isinstance(item, dict) and "id" in item else f"{index}_{item!s}"
-                    
-                    if item_id not in self.itens_processados:
-                        placa = self.extrair_placa(item)
-                        print(f"\n[+] Novo registro detectado: Placa {placa}")
-
-                        ticket_id = emitir_ticket(placa=placa)
-
-                        if ticket_id:
-                            cadastrar_entrada(
-    
-                                ticket_id=ticket_id,
-                                placa=placa,
-                                data_hora_entrada=datetime.now().isoformat(
-                                    timespec="seconds"
-                                )
-                             )
-
-                            print(f"[OK] Entrada registrada: {placa}")
-                            self.itens_processados.add(item_id)
-                        else:
-                            print("[ERRO] Ticket não foi confirmado para impressão.")
-
-            # Caso 2: O JSON contém apenas o último veículo recebido
-            else:
-                if dados != self.ultimo_registro_processado:
-                    placa = self.extrair_placa(dados)
-                    print(f"\n[+] Novo registro detectado: Placa {placa}")
-                    emitir_ticket(placa=placa)
-                    self.ultimo_registro_processado = dados
+                return json.load(arquivo)
 
         except (json.JSONDecodeError, OSError) as erro:
-            print(f"[!] Erro ao tentar ler o JSON: {erro}")
+            print(f"[!] Não foi possível ler dados.json: {erro}")
+            return None
+
+    def inicializar_historico(self):
+        """
+        Registra os dados existentes antes de começar a monitorar.
+        Os registros antigos não geram tickets novamente.
+        """
+        dados = self.ler_dados()
+
+        if isinstance(dados, list):
+            for item in dados:
+                self.itens_processados.add(self.obter_id(item))
+
+        elif isinstance(dados, dict):
+            self.itens_processados.add(self.obter_id(dados))
+
+        print(
+            f"[i] Histórico inicial carregado: "
+            f"{len(self.itens_processados)} registro(s)."
+        )
+
+    def processar_arquivo(self, caminho):
+        if Path(caminho).resolve() != ARQUIVO.resolve():
+            return
+
+        with self.lock_processamento:
+            # Aguarda brevemente a gravação do arquivo.
+            time.sleep(0.2)
+
+            dados = self.ler_dados()
+
+            if dados is None:
+                return
+
+            if isinstance(dados, dict):
+                registros = [dados]
+            elif isinstance(dados, list):
+                registros = dados
+            else:
+                print("[!] Formato inesperado em dados.json.")
+                return
+
+            for item in registros:
+                item_id = self.obter_id(item)
+
+                if item_id in self.itens_processados:
+                    continue
+
+                placa = self.extrair_placa(item)
+
+                if not placa:
+                    print("[!] Registro ignorado: placa não informada.")
+                    continue
+
+                print(f"[+] Nova entrada detectada: {placa}")
+
+                try:
+                    resultado = emitir_ticket(placa=placa)
+
+                    # Considera processado somente se a emissão
+                    # não indicar falha explicitamente.
+                    if resultado is not None and resultado is not False:
+                        self.itens_processados.add(item_id)
+                        print(f"[OK] Ticket processado para {placa}")
+                    else:
+                        print(
+                            f"[!] Emissão não confirmada para {placa}. "
+                            "O registro poderá ser tentado novamente."
+                        )
+
+                except Exception as erro:
+                    print(
+                        f"[!] Erro ao emitir ticket para {placa}: {erro}"
+                    )
 
     def on_modified(self, event):
         if not event.is_directory:
@@ -94,22 +146,27 @@ class MonitorJson(FileSystemEventHandler):
 
 
 if __name__ == "__main__":
-    pasta = str(ARQUIVO.parent)
-
-    monitor = MonitorJson()
     observador = Observer()
+    monitor = MonitorJson()
 
-    observador.schedule(monitor, pasta, recursive=False)
+    observador.schedule(
+        monitor,
+        str(ARQUIVO.parent),
+        recursive=False,
+    )
+
     observador.start()
 
-    print(f"Monitorando entradas em: {ARQUIVO}")
-    print("Pronto para emitir tickets automaticamente. Pressione CTRL+C para parar.")
+    print(f"[i] Monitorando: {ARQUIVO}")
+    print("[i] Aguardando novas entradas. CTRL+C para encerrar.")
 
     try:
         while True:
             time.sleep(1)
+
     except KeyboardInterrupt:
-        print("\nEncerrando monitoramento...")
+        print("\n[i] Encerrando monitoramento...")
+
     finally:
         observador.stop()
         observador.join()
