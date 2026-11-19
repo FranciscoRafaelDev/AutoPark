@@ -7,11 +7,27 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from auth import (
+    COOKIE_NAME,
+    atualizar_perfil,
+    autenticar_supabase,
+    encerrar_sessao_supabase,
+    exigir_admin,
+    exigir_permissao,
+    listar_perfis,
+    obter_usuario_atual,
+)
+from camera import (
+    iniciar_camera_background,
+    obter_status_camera,
+    parar_camera_background,
+    processar_placa_detectada,
+)
 from db import (
     buscar_ticket,
     cadastrar_entrada,
@@ -24,19 +40,12 @@ from db import (
     usar_supabase,
 )
 from ticket import PASTA_TICKETS, emitir_ticket, gerar_numero_ticket_unico
-from camera import (
-    iniciar_camera_background,
-    obter_status_camera,
-    parar_camera_background,
-    processar_placa_detectada,
-)
 
 inicializar_banco()
 
 app = FastAPI(
     title="AutoPark API",
-    description="API REST para gestão de estacionamento, câmera OCR, emissão de tickets térmicos e integração com Supabase.",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 origens_permitidas = [
@@ -54,20 +63,67 @@ app.add_middleware(
 )
 
 
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+
 class EntradaPayload(BaseModel):
-    placa: str = Field(..., min_length=7, max_length=8, examples=["ABC1D23"])
-    vaga_codigo: str | None = Field(default=None, examples=["A-01"])
-    responsavel_nome: str | None = Field(default=None, examples=["Cliente Avulso"])
+    placa: str = Field(..., min_length=7, max_length=8)
+    vaga_codigo: str | None = None
+    responsavel_nome: str | None = None
 
 
 class SaidaPayload(BaseModel):
-    ticket_id: str = Field(..., examples=["2026111214000012"])
-    metodo_pagamento: str = Field(default="PIX", examples=["PIX", "CARTAO", "DINHEIRO"])
-    valor_pago: float | None = Field(default=None)
+    ticket_id: str
+    metodo_pagamento: str = "PIX"
+    valor_pago: float | None = None
 
 
 class CameraDeteccaoPayload(BaseModel):
-    placa: str = Field(..., min_length=7, max_length=8, examples=["BRA2E19"])
+    placa: str = Field(..., min_length=7, max_length=8)
+
+
+class AtualizarPerfilPayload(BaseModel):
+    papel: str
+    ativo: bool
+    permissoes: dict[str, bool]
+
+
+@app.post("/api/auth/login")
+def post_login(payload: LoginPayload, response: Response):
+    resultado = autenticar_supabase(payload.email, payload.password)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=resultado["access_token"],
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=60 * 60 * 8,
+    )
+    return {"usuario": resultado["usuario"]}
+
+
+@app.post("/api/auth/logout")
+def post_logout(response: Response, autopark_session: str | None = Cookie(default=None)):
+    encerrar_sessao_supabase(autopark_session)
+    response.delete_cookie(key=COOKIE_NAME, samesite="lax")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def get_me(usuario: dict = Depends(obter_usuario_atual)):
+    return {"usuario": usuario}
+
+
+@app.get("/api/admin/usuarios")
+def get_admin_usuarios(_: dict = Depends(exigir_admin)):
+    return listar_perfis()
+
+
+@app.patch("/api/admin/usuarios/{user_id}")
+def patch_admin_usuario(user_id: str, payload: AtualizarPerfilPayload, _: dict = Depends(exigir_admin)):
+    return atualizar_perfil(user_id, payload.papel, payload.ativo, payload.permissoes)
 
 
 @app.get("/api/health")
@@ -80,12 +136,13 @@ def health():
 
 
 @app.get("/api/resumo")
-def obter_resumo():
+def obter_resumo(usuario: dict = Depends(exigir_permissao("overview"))):
     vagas = listar_vagas()
     ativos = listar_estacionados()
     tickets = listar_tickets(limite=200)
     pagamentos = listar_pagamentos(limite=200)
-    faturamento_total = round(sum(float(p["valor"]) for p in pagamentos), 2)
+    pode_ver_financeiro = usuario.get("papel") == "admin" or bool((usuario.get("permissoes") or {}).get("reports"))
+    faturamento_total = round(sum(float(p["valor"]) for p in pagamentos), 2) if pode_ver_financeiro else None
     saidas_hoje = sum(1 for t in tickets if t.get("status") == "FINALIZADO")
 
     return {
@@ -100,22 +157,22 @@ def obter_resumo():
 
 
 @app.get("/api/camera/status")
-def get_camera_status():
+def get_camera_status(_: dict = Depends(exigir_permissao("camera"))):
     return obter_status_camera()
 
 
 @app.post("/api/camera/iniciar")
-def post_camera_iniciar():
+def post_camera_iniciar(_: dict = Depends(exigir_permissao("camera"))):
     return iniciar_camera_background()
 
 
 @app.post("/api/camera/parar")
-def post_camera_parar():
+def post_camera_parar(_: dict = Depends(exigir_permissao("camera"))):
     return parar_camera_background()
 
 
 @app.post("/api/camera/simular-deteccao", status_code=201)
-def post_camera_simular(payload: CameraDeteccaoPayload):
+def post_camera_simular(payload: CameraDeteccaoPayload, _: dict = Depends(exigir_permissao("camera"))):
     try:
         resultado = processar_placa_detectada(payload.placa)
         return {
@@ -128,17 +185,17 @@ def post_camera_simular(payload: CameraDeteccaoPayload):
 
 
 @app.get("/api/vagas")
-def get_vagas():
+def get_vagas(_: dict = Depends(exigir_permissao("spots"))):
     return listar_vagas()
 
 
 @app.get("/api/estacionamento/ativos")
-def get_ativos():
+def get_ativos(_: dict = Depends(exigir_permissao("vehicles"))):
     return listar_estacionados()
 
 
 @app.post("/api/estacionamento/entrada", status_code=201)
-def post_entrada(payload: EntradaPayload):
+def post_entrada(payload: EntradaPayload, _: dict = Depends(exigir_permissao("vehicles"))):
     try:
         numero_ticket = gerar_numero_ticket_unico()
         sessao = cadastrar_entrada(
@@ -160,7 +217,7 @@ def post_entrada(payload: EntradaPayload):
 
 
 @app.post("/api/estacionamento/saida")
-def post_saida(payload: SaidaPayload):
+def post_saida(payload: SaidaPayload, _: dict = Depends(exigir_permissao("vehicles"))):
     try:
         return registrar_saida(
             ticket_id=payload.ticket_id,
@@ -174,12 +231,12 @@ def post_saida(payload: SaidaPayload):
 
 
 @app.get("/api/tickets")
-def get_tickets():
+def get_tickets(_: dict = Depends(exigir_permissao("tickets"))):
     return listar_tickets()
 
 
 @app.get("/api/tickets/{ticket_id}/pdf")
-def get_ticket_pdf(ticket_id: str):
+def get_ticket_pdf(ticket_id: str, _: dict = Depends(exigir_permissao("tickets"))):
     caminho = PASTA_TICKETS / f"ticket_{ticket_id}.pdf"
     if not caminho.exists():
         sessao = buscar_ticket(ticket_id)
@@ -190,5 +247,5 @@ def get_ticket_pdf(ticket_id: str):
 
 
 @app.get("/api/pagamentos")
-def get_pagamentos():
+def get_pagamentos(_: dict = Depends(exigir_permissao("payments"))):
     return listar_pagamentos()
