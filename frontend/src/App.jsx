@@ -1,50 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
 
-const fallbackState = {
+const estadoInicial = {
   resumo: {
     capacidade: 12,
-    estacionados_agora: 3,
-    entradas_hoje: 5,
-    saidas_hoje: 2,
-    faturamento_hoje: 43.5,
-    banco_ativo: 'Modo Demonstração (API offline)',
+    estacionados_agora: 0,
+    entradas_hoje: 0,
+    saidas_hoje: 0,
+    faturamento_hoje: null,
+    banco_ativo: 'Supabase (PostgreSQL)',
     camera: {
       ativa: false,
       conectada: false,
       ultima_placa: null,
       ultimo_horario: null,
-      mensagem: 'API offline',
+      mensagem: 'Inativa',
     },
   },
-  vagas: [
-    { codigo: 'A-01', setor: 'A', ocupada: true },
-    { codigo: 'A-02', setor: 'A', ocupada: false },
-    { codigo: 'A-03', setor: 'A', ocupada: true },
-    { codigo: 'A-04', setor: 'A', ocupada: false },
-    { codigo: 'B-01', setor: 'B', ocupada: true },
-    { codigo: 'B-02', setor: 'B', ocupada: false },
-    { codigo: 'B-03', setor: 'B', ocupada: false },
-    { codigo: 'B-04', setor: 'B', ocupada: false },
-    { codigo: 'C-01', setor: 'C', ocupada: false },
-    { codigo: 'C-02', setor: 'C', ocupada: false },
-    { codigo: 'C-03', setor: 'C', ocupada: false },
-    { codigo: 'C-04', setor: 'C', ocupada: false },
-  ],
-  ativos: [
-    { ticket_id: '2026111208420011', placa: 'ABC1D23', vaga_codigo: 'A-01', entrada: '08:42', duracao: '2h 18min', valor_parcial: 18.0, status: 'ESTACIONADO' },
-    { ticket_id: '2026111209160024', placa: 'FJK4A56', vaga_codigo: 'A-03', entrada: '09:16', duracao: '1h 44min', valor_parcial: 15.0, status: 'ESTACIONADO' },
-    { ticket_id: '2026111210030089', placa: 'GHT7B89', vaga_codigo: 'B-01', entrada: '10:03', duracao: '57min', valor_parcial: 12.0, status: 'ESTACIONADO' },
-  ],
-  tickets: [
-    { ticket_id: '2026111210030089', placa: 'GHT7B89', vaga_codigo: 'B-01', entrada: '10:03', status: 'ESTACIONADO' },
-    { ticket_id: '2026111209160024', placa: 'FJK4A56', vaga_codigo: 'A-03', entrada: '09:16', status: 'ESTACIONADO' },
-    { ticket_id: '2026111208420011', placa: 'ABC1D23', vaga_codigo: 'A-01', entrada: '08:42', status: 'ESTACIONADO' },
-  ],
-  pagamentos: [
-    { ticket_id: '2026111207300019', placa: 'KLM8A12', metodo: 'PIX', valor: 25.0, pago_em: '10:34' },
-    { ticket_id: '2026111207100042', placa: 'BCD3E45', metodo: 'CARTAO', valor: 18.5, pago_em: '10:12' },
-  ],
+  vagas: [],
+  ativos: [],
+  tickets: [],
+  pagamentos: [],
 };
 
 const currency = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
@@ -55,6 +31,65 @@ function formatTime(isoOrTime) {
   if (isoOrTime.length <= 8) return isoOrTime;
   const d = new Date(isoOrTime);
   return Number.isNaN(d.getTime()) ? isoOrTime : d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function extrairHora(isoOrTime) {
+  if (!isoOrTime) return null;
+  if (isoOrTime.length <= 8 && isoOrTime.includes(':')) {
+    const h = parseInt(isoOrTime.split(':')[0], 10);
+    return Number.isNaN(h) ? null : h;
+  }
+  const d = new Date(isoOrTime);
+  return Number.isNaN(d.getTime()) ? null : d.getHours();
+}
+
+function calcularFinanceiro(tickets, pagamentos, ativos, resumo) {
+  const totalFaturado = pagamentos.reduce((acc, p) => acc + Number(p.valor || 0), 0);
+  const receitaEmAberto = ativos.reduce((acc, a) => acc + Number(a.valor_parcial || 0), 0);
+  const ticketMedio = pagamentos.length ? totalFaturado / pagamentos.length : 0;
+  const taxaOcupacao = Math.min(100, Math.round((ativos.length / Math.max(1, resumo.capacidade)) * 100));
+
+  const metodosBase = ['PIX', 'CARTAO', 'DINHEIRO'];
+  const porMetodo = metodosBase.map(metodo => {
+    const itens = pagamentos.filter(p => (p.metodo || '').toUpperCase() === metodo);
+    const total = itens.reduce((acc, p) => acc + Number(p.valor || 0), 0);
+    const percentual = totalFaturado > 0 ? Math.round((total / totalFaturado) * 100) : 0;
+    return { metodo, quantidade: itens.length, total, percentual };
+  });
+
+  const contagemHoras = Array.from({ length: 24 }, (_, hora) => ({ hora, quantidade: 0 }));
+  tickets.forEach(t => {
+    const h = extrairHora(t.entrada);
+    if (h !== null && h >= 0 && h < 24) {
+      contagemHoras[h].quantidade += 1;
+    }
+  });
+
+  const horasExibidas = contagemHoras.filter(
+    item => (item.hora >= 7 && item.hora <= 22) || item.quantidade > 0
+  );
+  const maxEntradas = Math.max(1, ...horasExibidas.map(h => h.quantidade));
+  const pico = horasExibidas.reduce(
+    (melhor, atual) => (atual.quantidade > melhor.quantidade ? atual : melhor),
+    { hora: null, quantidade: 0 }
+  );
+
+  const horarioPicoLabel =
+    pico.quantidade > 0
+      ? `${String(pico.hora).padStart(2, '0')}h - ${String((pico.hora + 1) % 24).padStart(2, '0')}h`
+      : 'Sem dados';
+
+  return {
+    totalFaturado,
+    receitaEmAberto,
+    ticketMedio,
+    taxaOcupacao,
+    porMetodo,
+    horasExibidas,
+    maxEntradas,
+    pico,
+    horarioPicoLabel,
+  };
 }
 
 const Icons = {
@@ -123,7 +158,7 @@ const pages = [
   ['spots', 'spots', 'Mapa de vagas'],
   ['tickets', 'tickets', 'Tickets emitidos'],
   ['payments', 'payments', 'Pagamentos'],
-  ['reports', 'reports', 'Relatório diário'],
+  ['reports', 'revenue', 'Relatório financeiro'],
   ['settings', 'settings', 'Configurações'],
 ];
 const pageTitles = Object.fromEntries(pages.map(([id, , label]) => [id, label]));
@@ -161,40 +196,47 @@ function PlateBadge({ plate }) {
 }
 
 function Login({ onLogin, theme }) {
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('autopark');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  function submit(event) {
+  async function submit(event) {
     event.preventDefault();
-    if (username.trim() === 'admin' && password === 'autopark') onLogin(username.trim());
-    else setError('Credenciais inválidas.');
+    setError('');
+    setLoading(true);
+    try {
+      const { usuario } = await api.login(email.trim(), password);
+      onLogin(usuario);
+    } catch (err) {
+      setError(err.message || 'Falha ao autenticar.');
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
     <section className="login-screen">
       <form className="login-card" onSubmit={submit}>
         <div className="login-brand">
-          <BrandLogo size="lg" subtitle="Sistema Integrado React + FastAPI + Supabase" theme={theme} />
+          <BrandLogo size="lg" subtitle="Autenticação via Supabase Auth" theme={theme} />
         </div>
         <div className="login-header">
           <h1>Acesse o terminal operacional</h1>
-          <p className="muted">Monitore entradas, câmera OCR, tickets térmicos e caixa.</p>
+          <p className="muted">Entre com seu e-mail e senha cadastrados.</p>
         </div>
         <label className="field">
-          <span>Usuário operador</span>
-          <input autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} required />
+          <span>E-mail</span>
+          <input type="email" autoComplete="email" value={email} onChange={e => setEmail(e.target.value)} required />
         </label>
         <label className="field">
-          <span>Senha de acesso</span>
+          <span>Senha</span>
           <input type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required />
         </label>
         {error && <div className="login-error" role="alert">{error}</div>}
-        <button type="submit" className="primary-btn login-submit">Entrar no painel →</button>
-        <div className="demo-credentials">
-          <span>Acesso demonstrativo</span>
-          <code>admin / autopark</code>
-        </div>
+        <button type="submit" className="primary-btn login-submit" disabled={loading}>
+          {loading ? 'Validando...' : 'Entrar no painel →'}
+        </button>
       </form>
     </section>
   );
@@ -258,10 +300,12 @@ function DataTable({ title, subtitle, headers, rows, searchable = true, action }
 }
 
 export default function App() {
-  const [user, setUser] = useState(() => sessionStorage.getItem('autopark-demo-login') || '');
+  const [usuario, setUsuario] = useState(null);
+  const [verificandoSessao, setVerificandoSessao] = useState(true);
+  const [usuariosAdmin, setUsuariosAdmin] = useState([]);
   const [page, setPage] = useState('overview');
   const [theme, setTheme] = useState(() => localStorage.getItem('autopark-theme') || 'dark');
-  const [estado, setEstado] = useState(fallbackState);
+  const [estado, setEstado] = useState(estadoInicial);
   const [apiOnline, setApiOnline] = useState(false);
   const [aviso, setAviso] = useState('');
   const [showNewEntry, setShowNewEntry] = useState(false);
@@ -270,14 +314,45 @@ export default function App() {
   const [placaSimulada, setPlacaSimulada] = useState('BRA2E19');
   const ultimaPlacaConhecida = useRef(null);
 
+  const temPermissao = (modulo) =>
+    usuario?.papel === 'admin' || Boolean(usuario?.permissoes?.[modulo]);
+
+  const paginasPermitidas = useMemo(
+    () => pages.filter(([id]) => usuario?.papel === 'admin' || Boolean(usuario?.permissoes?.[id])),
+    [usuario]
+  );
+
+  const { resumo, ativos, vagas, tickets, pagamentos } = estado;
+
+  const financeiro = useMemo(
+    () => calcularFinanceiro(tickets, pagamentos, ativos, resumo),
+    [tickets, pagamentos, ativos, resumo]
+  );
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('autopark-theme', theme);
   }, [theme]);
 
+  useEffect(() => {
+    api.me()
+      .then(({ usuario: u }) => setUsuario(u))
+      .catch(() => setUsuario(null))
+      .finally(() => setVerificandoSessao(false));
+  }, []);
+
+  useEffect(() => {
+    if (!usuario) return;
+    const permitido = usuario.papel === 'admin' || Boolean(usuario.permissoes?.[page]);
+    if (!permitido && paginasPermitidas.length) {
+      setPage(paginasPermitidas[0][0]);
+    }
+  }, [usuario, page, paginasPermitidas]);
+
   async function carregarDados() {
+    if (!usuario) return;
     try {
-      const dados = await api.obterPainel();
+      const dados = await api.obterPainel(usuario);
       const cam = dados.resumo?.camera;
       if (cam?.ultima_placa && cam.ultima_placa !== ultimaPlacaConhecida.current) {
         if (ultimaPlacaConhecida.current !== null) {
@@ -287,39 +362,35 @@ export default function App() {
       }
       setEstado(dados);
       setApiOnline(true);
-    } catch {
-      setApiOnline(false);
+    } catch (err) {
+      if (err.status === 401) {
+        setUsuario(null);
+      } else {
+        setApiOnline(false);
+      }
     }
   }
 
   useEffect(() => {
-    if (!user) return undefined;
+    if (!usuario) return undefined;
     carregarDados();
+    if (usuario.papel === 'admin') {
+      api.listarUsuarios().then(setUsuariosAdmin).catch(() => {});
+    }
     const timer = setInterval(carregarDados, 3000);
     return () => clearInterval(timer);
-  }, [user]);
+  }, [usuario]);
 
   async function handleRegistrarEntrada(e) {
     e.preventDefault();
     setAviso('');
     try {
-      if (apiOnline) {
-        const novo = await api.registrarEntrada({
-          placa: placaInput,
-          vaga_codigo: vagaInput || null,
-        });
-        await carregarDados();
-        setAviso(`Entrada registrada! Ticket ${novo.ticket_id} emitido.`);
-      } else {
-        const tId = `${Date.now()}`;
-        setEstado(prev => ({
-          ...prev,
-          ativos: [
-            { ticket_id: tId, placa: placaInput.toUpperCase(), vaga_codigo: vagaInput || 'A-02', entrada: 'Agora', duracao: '1min', valor_parcial: 8.0, status: 'ESTACIONADO' },
-            ...prev.ativos,
-          ],
-        }));
-      }
+      const novo = await api.registrarEntrada({
+        placa: placaInput,
+        vaga_codigo: vagaInput || null,
+      });
+      await carregarDados();
+      setAviso(`Entrada registrada! Ticket ${novo.ticket_id} emitido.`);
       setPlacaInput('');
       setShowNewEntry(false);
     } catch (err) {
@@ -330,16 +401,9 @@ export default function App() {
   async function handleSaida(ticketId, metodo = 'PIX') {
     setAviso('');
     try {
-      if (apiOnline) {
-        await api.registrarSaida({ ticket_id: ticketId, metodo_pagamento: metodo });
-        await carregarDados();
-        setAviso(`Saída e pagamento (${metodo}) do ticket ${ticketId} confirmados.`);
-      } else {
-        setEstado(prev => ({
-          ...prev,
-          ativos: prev.ativos.filter(a => a.ticket_id !== ticketId),
-        }));
-      }
+      await api.registrarSaida({ ticket_id: ticketId, metodo_pagamento: metodo });
+      await carregarDados();
+      setAviso(`Saída e pagamento (${metodo}) do ticket ${ticketId} confirmados.`);
     } catch (err) {
       setAviso(err.message);
     }
@@ -370,19 +434,55 @@ export default function App() {
     }
   }
 
-  if (!user) {
+  async function handleLogout() {
+    await api.logout().catch(() => {});
+    setUsuario(null);
+    setUsuariosAdmin([]);
+    setEstado(estadoInicial);
+  }
+
+  async function handleAlternarPermissao(alvo, modulo) {
+    const novasPermissoes = {
+      ...(alvo.permissoes || {}),
+      [modulo]: !alvo.permissoes?.[modulo],
+    };
+    try {
+      const atualizado = await api.atualizarUsuario(alvo.id, {
+        papel: alvo.papel,
+        ativo: alvo.ativo,
+        permissoes: novasPermissoes,
+      });
+      setUsuariosAdmin(prev => prev.map(u => (u.id === alvo.id ? atualizado : u)));
+    } catch (err) {
+      setAviso(err.message);
+    }
+  }
+
+  async function handleAlterarPapel(alvo, novoPapel) {
+    try {
+      const atualizado = await api.atualizarUsuario(alvo.id, {
+        papel: novoPapel,
+        ativo: alvo.ativo,
+        permissoes: alvo.permissoes || {},
+      });
+      setUsuariosAdmin(prev => prev.map(u => (u.id === alvo.id ? atualizado : u)));
+    } catch (err) {
+      setAviso(err.message);
+    }
+  }
+
+  if (verificandoSessao) {
     return (
-      <Login
-        theme={theme}
-        onLogin={u => {
-          sessionStorage.setItem('autopark-demo-login', u);
-          setUser(u);
-        }}
-      />
+      <section className="login-screen">
+        <p className="muted">Verificando sessão...</p>
+      </section>
     );
   }
 
-  const { resumo, ativos, vagas, tickets, pagamentos } = estado;
+  if (!usuario) {
+    return <Login theme={theme} onLogin={setUsuario} />;
+  }
+
   const cameraInfo = resumo?.camera || { ativa: false, conectada: false, mensagem: 'Inativa' };
   const occupancyPct = Math.min(100, Math.round((ativos.length / Math.max(1, resumo.capacidade)) * 100));
 
@@ -394,7 +494,7 @@ export default function App() {
     <span className="tabular">{v.duracao}</span>,
     <strong className="tabular">{currency.format(v.valor_parcial)}</strong>,
     <div className="row-actions">
-      {apiOnline && (
+      {apiOnline && temPermissao('tickets') && (
         <a className="ghost-btn" href={api.urlPdfTicket(v.ticket_id)} target="_blank" rel="noreferrer">
           PDF 80mm
         </a>
@@ -413,7 +513,7 @@ export default function App() {
         </div>
         <div className="nav-label">OPERAÇÃO</div>
         <nav className="nav">
-          {pages.map(([id, iconKey, label]) => (
+          {paginasPermitidas.map(([id, iconKey, label]) => (
             <button key={id} type="button" className={page === id ? 'active' : ''} onClick={() => setPage(id)}>
               <span className="ico">{Icons[iconKey]}</span>
               <span>{label}</span>
@@ -435,7 +535,7 @@ export default function App() {
 
         <div className="side-bottom">
           <span className="status-dot" />
-          <span>{apiOnline ? `Sincronizado (3s) · ${resumo.banco_ativo}` : 'Modo Offline (Local)'}</span>
+          <span>{usuario.nome} ({usuario.papel})</span>
         </div>
       </aside>
 
@@ -446,29 +546,33 @@ export default function App() {
             <h1 className="heading">{pageTitles[page]}</h1>
           </div>
           <div className="top-actions">
-            <button
-              type="button"
-              className={`camera-chip ${cameraInfo.conectada ? 'cam-online' : cameraInfo.ativa ? 'cam-starting' : 'cam-idle'}`}
-              onClick={() => setPage('camera')}
-              title={cameraInfo.mensagem}
-            >
-              <span className="cam-dot" />
-              <span>
-                {cameraInfo.conectada
-                  ? `Câmera OCR Ativa${cameraInfo.ultima_placa ? ` · Última: ${cameraInfo.ultima_placa}` : ''}`
-                  : 'Câmera OCR: Pronta'}
-              </span>
-            </button>
+            {temPermissao('camera') && (
+              <button
+                type="button"
+                className={`camera-chip ${cameraInfo.conectada ? 'cam-online' : cameraInfo.ativa ? 'cam-starting' : 'cam-idle'}`}
+                onClick={() => setPage('camera')}
+                title={cameraInfo.mensagem}
+              >
+                <span className="cam-dot" />
+                <span>
+                  {cameraInfo.conectada
+                    ? `Câmera OCR Ativa${cameraInfo.ultima_placa ? ` · Última: ${cameraInfo.ultima_placa}` : ''}`
+                    : 'Câmera OCR: Pronta'}
+                </span>
+              </button>
+            )}
 
-            <button type="button" className="primary-btn btn-sm" onClick={() => setShowNewEntry(true)}>
-              <span className="btn-ico">{Icons.plus}</span>
-              Nova Entrada
-            </button>
+            {temPermissao('vehicles') && (
+              <button type="button" className="primary-btn btn-sm" onClick={() => setShowNewEntry(true)}>
+                <span className="btn-ico">{Icons.plus}</span>
+                Nova Entrada
+              </button>
+            )}
             <button type="button" className="icon-btn" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label="Alternar tema">
               {theme === 'dark' ? Icons.sun : Icons.moon}
             </button>
             <div className="date-chip">{dateLabel}</div>
-            <button type="button" className="link-button" onClick={() => { sessionStorage.removeItem('autopark-demo-login'); setUser(''); }}>
+            <button type="button" className="link-button" onClick={handleLogout}>
               Sair
             </button>
           </div>
@@ -476,26 +580,30 @@ export default function App() {
 
         {aviso && <div className="alert-banner">{aviso}</div>}
 
-        {page === 'overview' && (
+        {page === 'overview' && temPermissao('overview') && (
           <>
             <section className="cards">
               <Card label="Veículos no pátio" iconKey="vehicles" value={ativos.length} hint={`${resumo.capacidade - ativos.length} vagas livres`} accent="blue" />
               <Card label="Entradas registradas" iconKey="entry" value={resumo.entradas_hoje} hint="Manual + Câmera OCR" accent="emerald" />
               <Card label="Saídas concluídas" iconKey="exit" value={resumo.saidas_hoje} hint="Baixas no caixa" accent="slate" />
-              <Card label="Faturamento" iconKey="revenue" value={currency.format(resumo.faturamento_hoje)} hint="Total liquidado" accent="emerald" />
+              {resumo.faturamento_hoje !== null && (
+                <Card label="Faturamento" iconKey="revenue" value={currency.format(resumo.faturamento_hoje)} hint="Total liquidado" accent="emerald" />
+              )}
             </section>
-            <div className="content">
-              <DataTable
-                title="Veículos estacionados agora"
-                subtitle="Atualizado automaticamente a cada 3 segundos com leituras da câmera e entradas manuais"
-                headers={['Placa', 'Ticket', 'Vaga', 'Entrada', 'Permanência', 'Parcial', 'Ações']}
-                rows={vehicleRows}
-              />
-            </div>
+            {temPermissao('vehicles') && (
+              <div className="content">
+                <DataTable
+                  title="Veículos estacionados agora"
+                  subtitle="Atualizado automaticamente a cada 3 segundos com leituras da câmera e entradas manuais"
+                  headers={['Placa', 'Ticket', 'Vaga', 'Entrada', 'Permanência', 'Parcial', 'Ações']}
+                  rows={vehicleRows}
+                />
+              </div>
+            )}
           </>
         )}
 
-        {page === 'vehicles' && (
+        {page === 'vehicles' && temPermissao('vehicles') && (
           <DataTable
             title="Veículos no pátio"
             subtitle="Controle de entradas, impressão de ticket 80mm e saída"
@@ -504,7 +612,7 @@ export default function App() {
           />
         )}
 
-        {page === 'camera' && (
+        {page === 'camera' && temPermissao('camera') && (
           <section className="section">
             <div className="section-head">
               <div>
@@ -556,7 +664,7 @@ export default function App() {
           </section>
         )}
 
-        {page === 'spots' && (
+        {page === 'spots' && temPermissao('spots') && (
           <section className="section">
             <div className="section-head">
               <div>
@@ -577,7 +685,7 @@ export default function App() {
           </section>
         )}
 
-        {page === 'tickets' && (
+        {page === 'tickets' && temPermissao('tickets') && (
           <DataTable
             title="Histórico de tickets emitidos"
             subtitle="Cada entrada gera um PDF térmico de 80mm com código de barras Code128"
@@ -593,7 +701,7 @@ export default function App() {
           />
         )}
 
-        {page === 'payments' && (
+        {page === 'payments' && temPermissao('payments') && (
           <DataTable
             title="Pagamentos registrados"
             subtitle="Baixas de sessões gravadas na tabela pagamentos"
@@ -608,38 +716,183 @@ export default function App() {
           />
         )}
 
-        {page === 'reports' && (
-          <section className="section">
-            <div className="section-head">
-              <div>
-                <h2 className="section-title">Relatório operacional</h2>
-                <div className="section-sub">{dateLabel}</div>
+        {page === 'reports' && temPermissao('reports') && (
+          <div className="finance-stack">
+            <section className="cards">
+              <Card
+                label="Faturamento liquidado"
+                iconKey="revenue"
+                value={currency.format(financeiro.totalFaturado)}
+                hint={`${pagamentos.length} pagamento(s) confirmado(s)`}
+                accent="emerald"
+              />
+              <Card
+                label="Receita em aberto"
+                iconKey="payments"
+                value={currency.format(financeiro.receitaEmAberto)}
+                hint={`${ativos.length} veículo(s) no pátio`}
+                accent="blue"
+              />
+              <Card
+                label="Ticket médio"
+                iconKey="tickets"
+                value={currency.format(financeiro.ticketMedio)}
+                hint="Média por saída finalizada"
+                accent="slate"
+              />
+              <Card
+                label="Horário de pico"
+                iconKey="overview"
+                value={financeiro.horarioPicoLabel}
+                hint={
+                  financeiro.pico.quantidade > 0
+                    ? `${financeiro.pico.quantidade} entrada(s) no pico`
+                    : 'Aguardando entradas'
+                }
+                accent="blue"
+              />
+            </section>
+
+            <div className="finance-grid">
+              <section className="section">
+                <div className="section-head">
+                  <div>
+                    <h2 className="section-title">Faturamento por método de pagamento</h2>
+                    <div className="section-sub">Distribuição dos valores liquidados no caixa</div>
+                  </div>
+                </div>
+                <div className="method-bars">
+                  {financeiro.porMetodo.map(item => (
+                    <div className="method-bar-row" key={item.metodo}>
+                      <div className="method-bar-meta">
+                        <span className="method-pill">{item.metodo}</span>
+                        <span className="muted tabular">{item.quantidade} pgto(s) · {item.percentual}%</span>
+                        <strong className="tabular">{currency.format(item.total)}</strong>
+                      </div>
+                      <div className="patio-bar-track">
+                        <div className="patio-bar-fill" style={{ width: `${item.percentual}%` }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <section className="section">
+                <div className="section-head">
+                  <div>
+                    <h2 className="section-title">Resumo operacional</h2>
+                    <div className="section-sub">{dateLabel}</div>
+                  </div>
+                  <button type="button" className="primary-btn btn-sm" onClick={() => window.print()}>
+                    Imprimir
+                  </button>
+                </div>
+                <div className="report-grid report-grid-2">
+                  <div className="report-item"><span>Banco conectado</span><strong>{resumo.banco_ativo}</strong></div>
+                  <div className="report-item"><span>Ocupação atual</span><strong className="tabular">{financeiro.taxaOcupacao}%</strong></div>
+                  <div className="report-item"><span>Entradas</span><strong className="tabular">{resumo.entradas_hoje}</strong></div>
+                  <div className="report-item"><span>Saídas</span><strong className="tabular">{resumo.saidas_hoje}</strong></div>
+                </div>
+              </section>
+            </div>
+
+            <section className="section">
+              <div className="section-head">
+                <div>
+                  <h2 className="section-title">Horários de pico (Entradas por hora)</h2>
+                  <div className="section-sub">Volume de acessos calculado automaticamente pelos tickets registrados</div>
+                </div>
               </div>
-              <button type="button" className="primary-btn btn-sm" onClick={() => window.print()}>Imprimir</button>
-            </div>
-            <div className="report-grid">
-              <div className="report-item"><span>Banco conectado</span><strong>{resumo.banco_ativo}</strong></div>
-              <div className="report-item"><span>Entradas</span><strong>{resumo.entradas_hoje}</strong></div>
-              <div className="report-item"><span>Saídas</span><strong>{resumo.saidas_hoje}</strong></div>
-              <div className="report-item"><span>Faturamento</span><strong>{currency.format(resumo.faturamento_hoje)}</strong></div>
-            </div>
-          </section>
+              <div className="peak-chart">
+                {financeiro.horasExibidas.map(item => {
+                  const altura = item.quantidade > 0
+                    ? Math.max(12, Math.round((item.quantidade / financeiro.maxEntradas) * 100))
+                    : 4;
+                  const ehPico = item.quantidade > 0 && item.quantidade === financeiro.pico.quantidade;
+                  return (
+                    <div className="peak-col" key={item.hora} title={`${String(item.hora).padStart(2, '0')}h: ${item.quantidade} entrada(s)`}>
+                      <span className="peak-count tabular">{item.quantidade > 0 ? item.quantidade : ''}</span>
+                      <div className="peak-bar-wrap">
+                        <div
+                          className={`peak-bar ${ehPico ? 'peak-bar-max' : ''} ${item.quantidade === 0 ? 'peak-bar-empty' : ''}`}
+                          style={{ height: `${altura}%` }}
+                        />
+                      </div>
+                      <span className="peak-hour tabular">{String(item.hora).padStart(2, '0')}h</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          </div>
         )}
 
-        {page === 'settings' && (
-          <section className="section">
-            <div className="section-head">
-              <div>
-                <h2 className="section-title">Configurações de ambiente</h2>
-                <div className="section-sub">Conexão React → FastAPI → Supabase</div>
+        {page === 'settings' && temPermissao('settings') && (
+          <div className="finance-stack">
+            <section className="section">
+              <div className="section-head">
+                <div>
+                  <h2 className="section-title">Permissões de usuários</h2>
+                  <div className="section-sub">Defina papel e acesso por módulo para cada funcionário</div>
+                </div>
               </div>
-            </div>
-            <div className="report-grid">
-              <div className="report-item"><span>Endpoint FastAPI</span><strong>{api.urlBase}</strong></div>
-              <div className="report-item"><span>Persistência ativa</span><strong>{resumo.banco_ativo}</strong></div>
-              <div className="report-item"><span>Documentação OpenAPI</span><strong><a href={`${api.urlBase}/docs`} target="_blank" rel="noreferrer">/docs</a></strong></div>
-            </div>
-          </section>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Usuário</th>
+                      <th>Papel</th>
+                      {pages.map(([id, , label]) => <th key={id}>{label}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {usuariosAdmin.map(u => (
+                      <tr key={u.id}>
+                        <td>
+                          <strong>{u.nome}</strong>
+                          <div className="section-sub">{u.email}</div>
+                        </td>
+                        <td>
+                          <select
+                            className="control"
+                            value={u.papel}
+                            onChange={e => handleAlterarPapel(u, e.target.value)}
+                          >
+                            <option value="funcionario">Funcionário</option>
+                            <option value="admin">Admin</option>
+                          </select>
+                        </td>
+                        {pages.map(([id]) => (
+                          <td key={id}>
+                            <input
+                              type="checkbox"
+                              checked={u.papel === 'admin' || Boolean(u.permissoes?.[id])}
+                              disabled={u.papel === 'admin'}
+                              onChange={() => handleAlternarPermissao(u, id)}
+                            />
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="section">
+              <div className="section-head">
+                <div>
+                  <h2 className="section-title">Configurações de ambiente</h2>
+                  <div className="section-sub">Conexão React → FastAPI → Supabase</div>
+                </div>
+              </div>
+              <div className="report-grid">
+                <div className="report-item"><span>Endpoint FastAPI</span><strong>{api.urlBase}</strong></div>
+                <div className="report-item"><span>Persistência ativa</span><strong>{resumo.banco_ativo}</strong></div>
+                <div className="report-item"><span>Documentação OpenAPI</span><strong><a href={`${api.urlBase}/docs`} target="_blank" rel="noreferrer">/docs</a></strong></div>
+              </div>
+            </section>
+          </div>
         )}
       </main>
 
