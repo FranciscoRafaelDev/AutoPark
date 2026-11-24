@@ -1,3 +1,5 @@
+import csv
+import io
 import os
 from pathlib import Path
 
@@ -9,8 +11,10 @@ except ImportError:
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 from auth import (
     COOKIE_NAME,
@@ -29,6 +33,8 @@ from camera import (
     processar_placa_detectada,
 )
 from db import (
+    _req_supabase,
+    atualizar_config_tarifa,
     buscar_ticket,
     cadastrar_entrada,
     inicializar_banco,
@@ -36,6 +42,7 @@ from db import (
     listar_pagamentos,
     listar_tickets,
     listar_vagas,
+    obter_config_tarifa,
     registrar_saida,
     usar_supabase,
 )
@@ -43,14 +50,19 @@ from ticket import PASTA_TICKETS, emitir_ticket, gerar_numero_ticket_unico
 
 inicializar_banco()
 
+EM_PRODUCAO = os.getenv("APP_ENV", "development").lower() == "production"
+
 app = FastAPI(
     title="AutoPark API",
-    version="2.2.0",
+    version="2.3.0",
 )
 
 origens_permitidas = [
     o.strip()
-    for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    for o in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174",
+    ).split(",")
     if o.strip()
 ]
 
@@ -70,6 +82,8 @@ class LoginPayload(BaseModel):
 
 class EntradaPayload(BaseModel):
     placa: str = Field(..., min_length=7, max_length=8)
+    marca: str | None = None
+    modelo: str | None = None
     vaga_codigo: str | None = None
     responsavel_nome: str | None = None
 
@@ -90,6 +104,12 @@ class AtualizarPerfilPayload(BaseModel):
     permissoes: dict[str, bool]
 
 
+class TarifaPayload(BaseModel):
+    modo_cobranca: str
+    valor_hora: float = Field(..., gt=0)
+    valor_fixo: float = Field(..., gt=0)
+
+
 @app.post("/api/auth/login")
 def post_login(payload: LoginPayload, response: Response):
     resultado = autenticar_supabase(payload.email, payload.password)
@@ -97,8 +117,8 @@ def post_login(payload: LoginPayload, response: Response):
         key=COOKIE_NAME,
         value=resultado["access_token"],
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none" if EM_PRODUCAO else "lax",
+        secure=EM_PRODUCAO,
         max_age=60 * 60 * 8,
     )
     return {"usuario": resultado["usuario"]}
@@ -107,7 +127,11 @@ def post_login(payload: LoginPayload, response: Response):
 @app.post("/api/auth/logout")
 def post_logout(response: Response, autopark_session: str | None = Cookie(default=None)):
     encerrar_sessao_supabase(autopark_session)
-    response.delete_cookie(key=COOKIE_NAME, samesite="lax")
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        samesite="none" if EM_PRODUCAO else "lax",
+        secure=EM_PRODUCAO,
+    )
     return {"ok": True}
 
 
@@ -124,6 +148,89 @@ def get_admin_usuarios(_: dict = Depends(exigir_admin)):
 @app.patch("/api/admin/usuarios/{user_id}")
 def patch_admin_usuario(user_id: str, payload: AtualizarPerfilPayload, _: dict = Depends(exigir_admin)):
     return atualizar_perfil(user_id, payload.papel, payload.ativo, payload.permissoes)
+
+
+@app.get("/api/configuracoes/tarifa")
+def get_tarifa(_: dict = Depends(obter_usuario_atual)):
+    return obter_config_tarifa()
+
+
+@app.put("/api/configuracoes/tarifa")
+def put_tarifa(payload: TarifaPayload, _: dict = Depends(exigir_admin)):
+    try:
+        return atualizar_config_tarifa(payload.modo_cobranca, payload.valor_hora, payload.valor_fixo)
+    except ValueError as erro:
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+
+
+@app.get("/api/relatorios/exportar.csv")
+def exportar_relatorio_csv(_: dict = Depends(exigir_permissao("reports"))):
+    pagamentos = listar_pagamentos(limite=1000)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(["Ticket", "Placa", "Metodo", "Valor", "Pago em"])
+    for p in pagamentos:
+        writer.writerow([p.get("ticket_id"), p.get("placa"), p.get("metodo"), p.get("valor"), p.get("pago_em")])
+    buffer.seek(0)
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=relatorio_autopark.csv"},
+    )
+
+
+@app.get("/api/relatorios/exportar.pdf")
+def exportar_relatorio_pdf(_: dict = Depends(exigir_permissao("reports"))):
+    pagamentos = listar_pagamentos(limite=1000)
+    total = sum(float(p.get("valor", 0)) for p in pagamentos)
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(40, 800, "AutoPark - Relatorio Financeiro")
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(40, 780, f"Total de pagamentos: {len(pagamentos)} | Faturamento total: R$ {total:.2f}")
+
+    y = 750
+    pdf.setFont("Helvetica-Bold", 9)
+    pdf.drawString(40, y, "Ticket")
+    pdf.drawString(130, y, "Placa")
+    pdf.drawString(210, y, "Metodo")
+    pdf.drawString(290, y, "Valor (R$)")
+    pdf.drawString(370, y, "Horario")
+    y -= 18
+    pdf.setFont("Helvetica", 9)
+
+    for p in pagamentos:
+        if y < 50:
+            pdf.showPage()
+            y = 800
+            pdf.setFont("Helvetica", 9)
+        pdf.drawString(40, y, str(p.get("ticket_id", "")))
+        pdf.drawString(130, y, str(p.get("placa", "")))
+        pdf.drawString(210, y, str(p.get("metodo", "")))
+        pdf.drawString(290, y, f"{float(p.get('valor', 0)):.2f}")
+        pdf.drawString(370, y, str(p.get("pago_em", ""))[:19])
+        y -= 16
+
+    pdf.save()
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=relatorio_autopark.pdf"},
+    )
+
+
+@app.delete("/api/lgpd/anonimizar/{placa}")
+def anonimizar_dados_cliente(placa: str, _: dict = Depends(exigir_admin)):
+    placa_limpa = placa.strip().upper()
+    if usar_supabase():
+        _req_supabase(
+            "PATCH",
+            f"sessoes?placa=eq.{placa_limpa}",
+            {"responsavel_nome": "ANONIMIZADO (LGPD)"},
+        )
+    return {"ok": True, "placa": placa_limpa}
 
 
 @app.get("/api/health")
@@ -201,6 +308,8 @@ def post_entrada(payload: EntradaPayload, _: dict = Depends(exigir_permissao("ve
         sessao = cadastrar_entrada(
             ticket_id=numero_ticket,
             placa=payload.placa,
+            marca=payload.marca,
+            modelo=payload.modelo,
             vaga_codigo=payload.vaga_codigo,
             responsavel_nome=payload.responsavel_nome,
         )

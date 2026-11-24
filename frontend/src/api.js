@@ -76,4 +76,16 @@ export const api = {
       body: JSON.stringify({ placa }),
     }),
   urlPdfTicket: (ticketId) => `${API_BASE}/api/tickets/${ticketId}/pdf`,
+  obterTarifa: () => requisitar('/api/configuracoes/tarifa'),
+  atualizarTarifa: (dados) =>
+    requisitar('/api/configuracoes/tarifa', {
+      method: 'PUT',
+      body: JSON.stringify(dados),
+    }),
+  anonimizarLgpd: (placa) =>
+    requisitar(`/api/lgpd/anonimizar/${encodeURIComponent(placa)}`, {
+      method: 'DELETE',
+    }),
+  urlExportarCsv: () => `${API_BASE}/api/relatorios/exportar.csv`,
+  urlExportarPdf: () => `${API_BASE}/api/relatorios/exportar.pdf`,
 };

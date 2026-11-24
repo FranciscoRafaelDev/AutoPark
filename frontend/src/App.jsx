@@ -310,8 +310,12 @@ export default function App() {
   const [aviso, setAviso] = useState('');
   const [showNewEntry, setShowNewEntry] = useState(false);
   const [placaInput, setPlacaInput] = useState('');
+  const [marcaInput, setMarcaInput] = useState('');
+  const [modeloInput, setModeloInput] = useState('');
   const [vagaInput, setVagaInput] = useState('');
   const [placaSimulada, setPlacaSimulada] = useState('BRA2E19');
+  const [tarifa, setTarifa] = useState({ modo_cobranca: 'TEMPO', valor_hora: 10, valor_fixo: 20 });
+  const [placaLgpd, setPlacaLgpd] = useState('');
   const ultimaPlacaConhecida = useRef(null);
 
   const temPermissao = (modulo) =>
@@ -374,6 +378,7 @@ export default function App() {
   useEffect(() => {
     if (!usuario) return undefined;
     carregarDados();
+    api.obterTarifa().then(setTarifa).catch(() => {});
     if (usuario.papel === 'admin') {
       api.listarUsuarios().then(setUsuariosAdmin).catch(() => {});
     }
@@ -387,11 +392,15 @@ export default function App() {
     try {
       const novo = await api.registrarEntrada({
         placa: placaInput,
+        marca: marcaInput || null,
+        modelo: modeloInput || null,
         vaga_codigo: vagaInput || null,
       });
       await carregarDados();
       setAviso(`Entrada registrada! Ticket ${novo.ticket_id} emitido.`);
       setPlacaInput('');
+      setMarcaInput('');
+      setModeloInput('');
       setShowNewEntry(false);
     } catch (err) {
       setAviso(err.message);
@@ -471,6 +480,37 @@ export default function App() {
     }
   }
 
+  async function handleSalvarTarifa(e) {
+    e.preventDefault();
+    setAviso('');
+    try {
+      const atualizada = await api.atualizarTarifa({
+        modo_cobranca: tarifa.modo_cobranca,
+        valor_hora: Number(tarifa.valor_hora),
+        valor_fixo: Number(tarifa.valor_fixo),
+      });
+      setTarifa(atualizada);
+      await carregarDados();
+      setAviso('Configuração de tarifa atualizada com sucesso.');
+    } catch (err) {
+      setAviso(err.message);
+    }
+  }
+
+  async function handleAnonimizarLgpd(e) {
+    e.preventDefault();
+    if (!placaLgpd.trim()) return;
+    setAviso('');
+    try {
+      const res = await api.anonimizarLgpd(placaLgpd.trim().toUpperCase());
+      setPlacaLgpd('');
+      await carregarDados();
+      setAviso(`Dados pessoais vinculados à placa ${res.placa} anonimizados (LGPD).`);
+    } catch (err) {
+      setAviso(err.message);
+    }
+  }
+
   if (verificandoSessao) {
     return (
       <section className="login-screen">
@@ -488,6 +528,7 @@ export default function App() {
 
   const vehicleRows = ativos.map(v => [
     <PlateBadge plate={v.placa} />,
+    [v.marca, v.modelo].filter(Boolean).join(' ') || '—',
     <span className="mono-chip">{v.ticket_id}</span>,
     <span className="spot-tag">{v.vaga_codigo}</span>,
     <span className="tabular">{formatTime(v.entrada)}</span>,
@@ -595,7 +636,7 @@ export default function App() {
                 <DataTable
                   title="Veículos estacionados agora"
                   subtitle="Atualizado automaticamente a cada 3 segundos com leituras da câmera e entradas manuais"
-                  headers={['Placa', 'Ticket', 'Vaga', 'Entrada', 'Permanência', 'Parcial', 'Ações']}
+                  headers={['Placa', 'Veículo', 'Ticket', 'Vaga', 'Entrada', 'Permanência', 'Parcial', 'Ações']}
                   rows={vehicleRows}
                 />
               </div>
@@ -607,7 +648,7 @@ export default function App() {
           <DataTable
             title="Veículos no pátio"
             subtitle="Controle de entradas, impressão de ticket 80mm e saída"
-            headers={['Placa', 'Ticket', 'Vaga', 'Entrada', 'Permanência', 'Parcial', 'Ações']}
+            headers={['Placa', 'Veículo', 'Ticket', 'Vaga', 'Entrada', 'Permanência', 'Parcial', 'Ações']}
             rows={vehicleRows}
           />
         )}
@@ -783,9 +824,14 @@ export default function App() {
                     <h2 className="section-title">Resumo operacional</h2>
                     <div className="section-sub">{dateLabel}</div>
                   </div>
-                  <button type="button" className="primary-btn btn-sm" onClick={() => window.print()}>
-                    Imprimir
-                  </button>
+                  <div className="row-actions">
+                    <a className="ghost-btn" href={api.urlExportarCsv()} target="_blank" rel="noreferrer">
+                      Exportar CSV
+                    </a>
+                    <a className="primary-btn btn-sm" href={api.urlExportarPdf()} target="_blank" rel="noreferrer">
+                      Exportar PDF
+                    </a>
+                  </div>
                 </div>
                 <div className="report-grid report-grid-2">
                   <div className="report-item"><span>Banco conectado</span><strong>{resumo.banco_ativo}</strong></div>
@@ -829,6 +875,57 @@ export default function App() {
 
         {page === 'settings' && temPermissao('settings') && (
           <div className="finance-stack">
+            <section className="section">
+              <div className="section-head">
+                <div>
+                  <h2 className="section-title">Tarifação do estacionamento</h2>
+                  <div className="section-sub">Defina cobrança por tempo de permanência ou taxa fixa</div>
+                </div>
+              </div>
+              <form className="report-grid" onSubmit={handleSalvarTarifa}>
+                <label className="field">
+                  <span>Modo de cobrança</span>
+                  <select
+                    className="control"
+                    value={tarifa.modo_cobranca}
+                    onChange={e => setTarifa(prev => ({ ...prev, modo_cobranca: e.target.value }))}
+                  >
+                    <option value="TEMPO">Por tempo (valor/hora)</option>
+                    <option value="FIXO">Taxa fixa</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Valor por hora (R$)</span>
+                  <input
+                    className="control"
+                    type="number"
+                    step="0.50"
+                    min="0.50"
+                    value={tarifa.valor_hora}
+                    onChange={e => setTarifa(prev => ({ ...prev, valor_hora: e.target.value }))}
+                    required
+                  />
+                </label>
+                <label className="field">
+                  <span>Valor fixo (R$)</span>
+                  <input
+                    className="control"
+                    type="number"
+                    step="0.50"
+                    min="0.50"
+                    value={tarifa.valor_fixo}
+                    onChange={e => setTarifa(prev => ({ ...prev, valor_fixo: e.target.value }))}
+                    required
+                  />
+                </label>
+                <div className="row-actions">
+                  <button type="submit" className="primary-btn btn-sm">
+                    Salvar tarifa
+                  </button>
+                </div>
+              </form>
+            </section>
+
             <section className="section">
               <div className="section-head">
                 <div>
@@ -882,6 +979,30 @@ export default function App() {
             <section className="section">
               <div className="section-head">
                 <div>
+                  <h2 className="section-title">Conformidade LGPD</h2>
+                  <div className="section-sub">Anonimize dados pessoais de responsáveis preservando o histórico financeiro</div>
+                </div>
+              </div>
+              <form className="ocr-sim-box" onSubmit={handleAnonimizarLgpd}>
+                <div className="ocr-sim-controls">
+                  <input
+                    className="control"
+                    value={placaLgpd}
+                    onChange={e => setPlacaLgpd(e.target.value.toUpperCase())}
+                    placeholder="Placa (ex.: ABC1D23)"
+                    maxLength={8}
+                    required
+                  />
+                  <button type="submit" className="ghost-btn">
+                    Anonimizar dados (LGPD)
+                  </button>
+                </div>
+              </form>
+            </section>
+
+            <section className="section">
+              <div className="section-head">
+                <div>
                   <h2 className="section-title">Configurações de ambiente</h2>
                   <div className="section-sub">Conexão React → FastAPI → Supabase</div>
                 </div>
@@ -909,6 +1030,14 @@ export default function App() {
             <label className="field">
               <span>Placa (Mercosul ou antiga)</span>
               <input autoFocus value={placaInput} onChange={e => setPlacaInput(e.target.value.toUpperCase())} placeholder="Ex.: ABC1D23" maxLength={8} required />
+            </label>
+            <label className="field">
+              <span>Marca</span>
+              <input value={marcaInput} onChange={e => setMarcaInput(e.target.value)} placeholder="Ex.: Volkswagen" />
+            </label>
+            <label className="field">
+              <span>Modelo</span>
+              <input value={modeloInput} onChange={e => setModeloInput(e.target.value)} placeholder="Ex.: Polo" />
             </label>
             <label className="field">
               <span>Vaga (opcional — aloca livre automaticamente)</span>
