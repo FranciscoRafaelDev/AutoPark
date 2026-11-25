@@ -9,7 +9,7 @@ import cv2
 from db import cadastrar_entrada, validar_placa
 from ticket import emitir_ticket, gerar_numero_ticket_unico
 
-RTSP_URL = os.getenv("RTSP_URL", "rtsp://192.168.0.2:554/onvif1")
+RTSP_URL = os.getenv("RTSP_URL", "url da camera")
 PADRAO_PLACA_BR = re.compile(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")
 CONFIANCA_MINIMA = float(os.getenv("OCR_CONFIANCA_MINIMA", "0.35"))
 LEITURAS_PARA_CONFIRMAR = int(os.getenv("OCR_LEITURAS_CONFIRMAR", "1"))
