@@ -32,6 +32,16 @@ PERMISSOES_PADRAO = {
         "reports": True,
         "settings": True,
     },
+    "contador": {
+        "overview": True,
+        "vehicles": False,
+        "camera": False,
+        "spots": False,
+        "tickets": False,
+        "payments": True,
+        "reports": True,
+        "settings": False,
+    },
     "funcionario": {
         "overview": True,
         "vehicles": True,
@@ -153,7 +163,7 @@ def listar_perfis() -> list[dict]:
 
 
 def atualizar_perfil(user_id: str, papel: str, ativo: bool, permissoes: dict) -> dict:
-    if papel not in ("admin", "funcionario"):
+    if papel not in ("admin", "contador", "funcionario"):
         raise HTTPException(status_code=400, detail="Papel inválido.")
     atualizado = _req_supabase(
         "PATCH",

@@ -1,5 +1,5 @@
 import os
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = os.getenv("RTSP_FFMPEG_OPTIONS", "rtsp_transport;udp")
 
 import re
 import threading
@@ -11,8 +11,13 @@ from ticket import emitir_ticket, gerar_numero_ticket_unico
 
 RTSP_URL = os.getenv("RTSP_URL", "rtsp://192.168.0.2:554/onvif1")
 PADRAO_PLACA_BR = re.compile(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")
-CONFIANCA_MINIMA = 0.5
-COOLDOWN_SEGUNDOS = 30
+CONFIANCA_MINIMA = float(os.getenv("OCR_CONFIANCA_MINIMA", "0.35"))
+LEITURAS_PARA_CONFIRMAR = int(os.getenv("OCR_LEITURAS_CONFIRMAR", "1"))
+COOLDOWN_SEGUNDOS = int(os.getenv("OCR_COOLDOWN_SEGUNDOS", "30"))
+ROI_X1 = float(os.getenv("OCR_ROI_X1", "0.0"))
+ROI_Y1 = float(os.getenv("OCR_ROI_Y1", "0.0"))
+ROI_X2 = float(os.getenv("OCR_ROI_X2", "1.0"))
+ROI_Y2 = float(os.getenv("OCR_ROI_Y2", "1.0"))
 
 ESTADO_CAMERA = {
     "ativa": False,
@@ -55,6 +60,15 @@ MAPA_PARA_NUMERO = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "
 MAPA_PARA_LETRA = str.maketrans({"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B"})
 
 
+def _aplicar_roi(frame):
+    altura, largura = frame.shape[:2]
+    x1 = max(0, min(largura - 1, int(largura * ROI_X1)))
+    y1 = max(0, min(altura - 1, int(altura * ROI_Y1)))
+    x2 = max(x1 + 1, min(largura, int(largura * ROI_X2)))
+    y2 = max(y1 + 1, min(altura, int(altura * ROI_Y2)))
+    return frame[y1:y2, x1:x2], x1, y1
+
+
 def normalizar_e_validar(texto: str) -> str | None:
     limpo = re.sub(r"[^A-Z0-9]", "", (texto or "").upper())
     if limpo.startswith("BR") and len(limpo) > 7:
@@ -75,8 +89,12 @@ def normalizar_e_validar(texto: str) -> str | None:
     return None
 
 
-def detectar_placas_no_frame(frame, leitor_ocr, confianca_min: float = 0.25) -> list[dict]:
-    cinza = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+def detectar_placas_no_frame(frame, leitor_ocr, confianca_min: float = CONFIANCA_MINIMA) -> list[dict]:
+    recorte, offset_x, offset_y = _aplicar_roi(frame)
+    if recorte.size == 0:
+        return []
+
+    cinza = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
     resultados_ocr = leitor_ocr.readtext(
         cinza,
         allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
@@ -84,17 +102,18 @@ def detectar_placas_no_frame(frame, leitor_ocr, confianca_min: float = 0.25) -> 
     placas_encontradas = []
 
     for bbox, texto_bruto, confianca in resultados_ocr:
-        if confianca < confianca_min:
+        if float(confianca) < confianca_min:
             continue
         placa = normalizar_e_validar(texto_bruto)
         if placa:
-            bbox_original = [[int(x), int(y)] for x, y in bbox]
+            bbox_original = [[int(x) + offset_x, int(y) + offset_y] for x, y in bbox]
             placas_encontradas.append({
                 "placa": placa,
                 "confianca": float(confianca),
                 "bbox": bbox_original,
             })
     return placas_encontradas
+
 
 def processar_placa_detectada(placa: str) -> dict:
     placa_limpa = validar_placa(placa)
@@ -113,6 +132,27 @@ def processar_placa_detectada(placa: str) -> dict:
 
 def obter_status_camera() -> dict:
     return dict(ESTADO_CAMERA)
+
+
+def _registrar_se_confirmada(
+    placa: str,
+    agora: float,
+    contagem_leituras: dict[str, int],
+    ultimas_vistas: dict[str, float],
+) -> None:
+    if agora - ultimas_vistas.get(placa, 0.0) <= COOLDOWN_SEGUNDOS:
+        return
+
+    contagem_leituras[placa] = contagem_leituras.get(placa, 0) + 1
+    if contagem_leituras[placa] < LEITURAS_PARA_CONFIRMAR:
+        return
+
+    contagem_leituras[placa] = 0
+    ultimas_vistas[placa] = agora
+    try:
+        processar_placa_detectada(placa)
+    except ValueError:
+        pass
 
 
 def _loop_background():
@@ -145,6 +185,7 @@ def _loop_background():
     })
 
     ultimas_vistas: dict[str, float] = {}
+    contagem_leituras: dict[str, int] = {}
     ultimo_ocr = 0.0
 
     try:
@@ -158,14 +199,14 @@ def _loop_background():
             if agora - ultimo_ocr >= 1.0:
                 ultimo_ocr = agora
                 deteccoes = detectar_placas_no_frame(frame, leitor)
-                for item in deteccoes:
-                    placa = item["placa"]
-                    if agora - ultimas_vistas.get(placa, 0) > COOLDOWN_SEGUNDOS:
-                        ultimas_vistas[placa] = agora
-                        try:
-                            processar_placa_detectada(placa)
-                        except ValueError:
-                            pass
+                placas_no_ciclo = {item["placa"] for item in deteccoes}
+
+                for candidata in list(contagem_leituras.keys()):
+                    if candidata not in placas_no_ciclo:
+                        contagem_leituras[candidata] = 0
+
+                for placa in placas_no_ciclo:
+                    _registrar_se_confirmada(placa, agora, contagem_leituras, ultimas_vistas)
     finally:
         camera.liberar()
         ESTADO_CAMERA.update({
@@ -205,6 +246,7 @@ def iniciar_monitoramento():
         raise SystemExit("Erro: não foi possível conectar à câmera RTSP.")
 
     ultimas_vistas: dict[str, float] = {}
+    contagem_leituras: dict[str, int] = {}
     ultimas_deteccoes: list[dict] = []
     ultimo_ocr = 0.0
 
@@ -219,15 +261,14 @@ def iniciar_monitoramento():
             if agora - ultimo_ocr >= 1.0:
                 ultimo_ocr = agora
                 ultimas_deteccoes = detectar_placas_no_frame(frame, leitor)
+                placas_no_ciclo = {item["placa"] for item in ultimas_deteccoes}
 
-                for item in ultimas_deteccoes:
-                    placa = item["placa"]
-                    if agora - ultimas_vistas.get(placa, 0) > COOLDOWN_SEGUNDOS:
-                        ultimas_vistas[placa] = agora
-                        try:
-                            processar_placa_detectada(placa)
-                        except ValueError:
-                            pass
+                for candidata in list(contagem_leituras.keys()):
+                    if candidata not in placas_no_ciclo:
+                        contagem_leituras[candidata] = 0
+
+                for placa in placas_no_ciclo:
+                    _registrar_se_confirmada(placa, agora, contagem_leituras, ultimas_vistas)
 
             for item in ultimas_deteccoes:
                 pts = item["bbox"]
